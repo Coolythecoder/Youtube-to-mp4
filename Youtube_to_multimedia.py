@@ -1,4 +1,5 @@
 import os
+import shutil
 import sys
 import math
 import textwrap
@@ -48,6 +49,10 @@ MAX_VBR_KBPS = 25000  # 25 Mbps
 TARGET_HEIGHT = {"1080p": 1080, "1440p": 1440, "2160p (4K)": 2160}
 
 BROWSERS = ["chrome", "edge", "opera", "brave", "vivaldi", "chromium", "firefox"]
+
+# Prefer non-web YouTube clients to avoid PO-Token/web-format 403s
+DEFAULT_PLAYER_CLIENTS = []  # leave empty to avoid overriding yt-dlp defaults
+ALT_PLAYER_CLIENTS = ["android", "ios", "tv"]
 
 
 class App(ctk.CTk):
@@ -128,7 +133,7 @@ class App(ctk.CTk):
 
         ctk.CTkCheckBox(
             row2,
-            text="If normal fails, also try Android client",
+            text="If normal fails, also try Android/iOS/TV clients",
             variable=self.try_android_after,
         ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
 
@@ -365,19 +370,89 @@ class App(ctk.CTk):
             return {"cookiesfrombrowser": (self.browser_var.get(), prof, None, None)}
         return {}
 
+    def _yt_extractor_args(self, client):
+        """Return YouTube extractor_args for a *specific* Innertube client.
+
+        IMPORTANT: We do **not** override yt-dlp's default client selection unless
+        we are explicitly trying a specific client as a fallback.
+        """
+        if not client:
+            return None
+        return {"youtube": {"player_client": [client]}}
+
+    def _expand_attempts(self, attempts, vfilt):
+        """Expand a list of format selectors with safer fallbacks."""
+        uniq = []
+
+        def add(x):
+            if x and x not in uniq:
+                uniq.append(x)
+
+        for a in attempts:
+            add(a)
+
+        # If user set a max video bitrate filter, try the same selectors without it too
+        if vfilt:
+            for a in attempts:
+                add(a.replace(vfilt, ""))
+
+        # Ultimate fallbacks (no filters)
+        add("bv*+ba/b")
+        add("bestvideo*+bestaudio/best")
+        return uniq
+
     def _base_opts(self, outtmpl):
-        return {
+        # ---- External JS runtime / EJS setup (required for reliable YouTube support) ----
+        # yt-dlp now relies on an external JS runtime (Deno recommended) + EJS scripts to
+        # solve YouTube's JS challenges. See the official wiki for details.
+        # - https://github.com/yt-dlp/yt-dlp/wiki/EJS
+        deno_path = os.environ.get("YTDLP_DENO_PATH") or shutil.which("deno") or shutil.which("deno.exe")
+        if not deno_path:
+            # Common Deno install location (official installer)
+            home_deno = Path.home() / ".deno" / "bin" / ("deno.exe" if os.name == "nt" else "deno")
+            if home_deno.exists():
+                deno_path = str(home_deno)
+
+        js_runtimes = None
+        if deno_path:
+            js_runtimes = {"deno": {"path": deno_path}}
+        # If deno isn't found, we do not force anything; yt-dlp will warn (and formats may be missing)
+
+        # If the companion EJS package isn't installed, allow fetching EJS scripts from GitHub
+        remote_components = None
+        try:
+            import yt_dlp_ejs  # noqa: F401
+        except Exception:
+            remote_components = {"ejs:github"}
+
+        opts = {
             "outtmpl": outtmpl,
             "noplaylist": True,
             "merge_output_format": "mp4",
             "progress_hooks": [self._hook],
             "quiet": True,
-            "no_warnings": True,
+            "no_warnings": False,
             "retries": 10,
             "fragment_retries": 10,
             "http_chunk_size": 256 * 1024,
             "concurrent_fragment_downloads": 1,
+            "geo_bypass": True,
         }
+
+        if js_runtimes:
+            opts["js_runtimes"] = js_runtimes
+        if remote_components:
+            opts["remote_components"] = remote_components
+
+        # Add a browser-like UA by default (helps some networks/proxies)
+        opts["http_headers"] = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/123.0.0.0 Safari/537.36"
+            )
+        }
+        return opts
 
     def _on_vbr_change(self, val):
         val = int(val)
@@ -447,8 +522,12 @@ class App(ctk.CTk):
         outtmpl = os.path.join(self.save_dir, "%(title)s.%(ext)s")
         opts = self._base_opts(outtmpl)
         opts["format"] = fmt
-        if client == "android":
-            opts["extractor_args"] = {"youtube": {"player_client": ["android"]}}
+        # Prefer non-web clients to reduce 403 errors
+        ea = self._yt_extractor_args(client)
+
+        if ea:
+
+            opts["extractor_args"] = ea
         opts.update(auth_extra)
 
         # Choose remux vs re-encode
@@ -481,8 +560,12 @@ class App(ctk.CTk):
         # For audio-only we don't want to force a video merge format
         opts["merge_output_format"] = None
         opts["format"] = fmt
-        if client == "android":
-            opts["extractor_args"] = {"youtube": {"player_client": ["android"]}}
+        # Prefer non-web clients to reduce 403 errors
+        ea = self._yt_extractor_args(client)
+
+        if ea:
+
+            opts["extractor_args"] = ea
         opts.update(auth_extra)
         # Extract & convert to desired audio codec
         opts["postprocessors"] = [
@@ -530,7 +613,9 @@ class App(ctk.CTk):
             target_h = TARGET_HEIGHT[q]
             attempts.extend(self._height_attempts(target_h, audio_primary, vfilt))
 
-        clients = [None, "android"] if self.try_android_after.get() else [None]
+        clients = [None] + (ALT_PLAYER_CLIENTS if self.try_android_after.get() else [])
+        attempts = self._expand_attempts(attempts, vfilt)
+
         reencode = bool(self.reencode.get())
         target_kbps = int(self.vbr_limit.get() or 0)
 
@@ -580,7 +665,7 @@ class App(ctk.CTk):
         audio_primary = self._audio_primary()
         fmt = f"{audio_primary}/ba" if audio_primary != "ba" else "ba"
         pref_q = self._preferred_quality_from_ui()
-        clients = [None, "android"] if self.try_android_after.get() else [None]
+        clients = [None] + (ALT_PLAYER_CLIENTS if self.try_android_after.get() else [])
 
         self._start_job(self._audio_worker, url, fmt, "mp3", clients, auth, pref_q)
 
@@ -601,7 +686,7 @@ class App(ctk.CTk):
 
         audio_primary = self._audio_primary()
         fmt = f"{audio_primary}/ba" if audio_primary != "ba" else "ba"
-        clients = [None, "android"] if self.try_android_after.get() else [None]
+        clients = [None] + (ALT_PLAYER_CLIENTS if self.try_android_after.get() else [])
 
         self._start_job(self._audio_worker, url, fmt, "wav", clients, auth, "0")
 
@@ -643,13 +728,16 @@ class App(ctk.CTk):
         info = None
         used_client = "normal"
 
-        for client in [None, "android"]:
+        for client in [None] + ALT_PLAYER_CLIENTS:
             if self._cancel.is_set():
                 raise RuntimeError("Cancelled")
             try:
                 opts = dict(base)
-                if client == "android":
-                    opts["extractor_args"] = {"youtube": {"player_client": ["android"]}}
+                ea = self._yt_extractor_args(client)
+
+                if ea:
+
+                    opts["extractor_args"] = ea
                 with ydl.YoutubeDL(opts) as Y:
                     info = Y.extract_info(url, download=False)
                 used_client = client or "normal"
